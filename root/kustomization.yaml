@@ -1,0 +1,80 @@
+# The hub's root: applicationset.yaml (the library's components at a pinned
+# commit of its main branch) and deployment-root (self.yaml), with this
+# deployment's inputs. deployment-root syncs this directory, so a commit here (a
+# selection change, a new pin) reaches the hub.
+#
+# Your inputs (your repositories) are in inputs.env, not here:
+# scripts/set-inputs.sh writes that file (install guide, page 2), and the
+# replacements below copy its values over the REQUIRED- placeholders in
+# applicationset.yaml and self.yaml, so leave them. This file comes from the
+# template, and make update brings its changes; the template has no inputs.env,
+# so an update never touches yours. The library pin is libraryRevision in
+# applicationset.yaml (scripts/set-library.sh).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - applicationset.yaml
+  - self.yaml
+# Your inputs, from inputs.env. local-config keeps the ConfigMap out of the
+# render; a missing inputs.env, or a name missing from it, fails the render.
+configMapGenerator:
+  - name: deployment-inputs
+    envs: [inputs.env]
+    options:
+      disableNameSuffixHash: true
+      annotations:
+        config.kubernetes.io/local-config: "true"
+# Each input into every generator's values (0, ODF's 1, and the own-apps 2);
+# the deployment repository and its revision also into the own-apps generator
+# and deployment-root (self.yaml).
+replacements:
+  - source: { kind: ConfigMap, name: deployment-inputs, fieldPath: data.deploymentRepoURL }
+    targets:
+      - select: { group: argoproj.io, kind: ApplicationSet, name: apps }
+        fieldPaths:
+          - spec.generators.0.git.values.deploymentRepoURL
+          - spec.generators.1.matrix.generators.0.git.values.deploymentRepoURL
+          - spec.generators.2.git.values.deploymentRepoURL
+          - spec.generators.2.git.repoURL
+      - select: { group: argoproj.io, kind: Application, name: deployment-root }
+        fieldPaths:
+          - spec.source.repoURL
+  - source: { kind: ConfigMap, name: deployment-inputs, fieldPath: data.deploymentRevision }
+    targets:
+      - select: { group: argoproj.io, kind: ApplicationSet, name: apps }
+        fieldPaths:
+          - spec.generators.0.git.values.deploymentRevision
+          - spec.generators.1.matrix.generators.0.git.values.deploymentRevision
+          - spec.generators.2.git.values.deploymentRevision
+          - spec.generators.2.git.revision
+      - select: { group: argoproj.io, kind: Application, name: deployment-root }
+        fieldPaths:
+          - spec.source.targetRevision
+  - source: { kind: ConfigMap, name: deployment-inputs, fieldPath: data.catalogRepoURL }
+    targets:
+      - select: { group: argoproj.io, kind: ApplicationSet, name: apps }
+        fieldPaths:
+          - spec.generators.0.git.values.catalogRepoURL
+          - spec.generators.1.matrix.generators.0.git.values.catalogRepoURL
+          - spec.generators.2.git.values.catalogRepoURL
+  - source: { kind: ConfigMap, name: deployment-inputs, fieldPath: data.catalogRevision }
+    targets:
+      - select: { group: argoproj.io, kind: ApplicationSet, name: apps }
+        fieldPaths:
+          - spec.generators.0.git.values.catalogRevision
+          - spec.generators.1.matrix.generators.0.git.values.catalogRevision
+          - spec.generators.2.git.values.catalogRevision
+  - source: { kind: ConfigMap, name: deployment-inputs, fieldPath: data.keycloakOverlay }
+    targets:
+      - select: { group: argoproj.io, kind: ApplicationSet, name: apps }
+        fieldPaths:
+          - spec.generators.0.git.values.keycloakOverlay
+          - spec.generators.1.matrix.generators.0.git.values.keycloakOverlay
+          - spec.generators.2.git.values.keycloakOverlay
+  - source: { kind: ConfigMap, name: deployment-inputs, fieldPath: data.hubCertManager }
+    targets:
+      - select: { group: argoproj.io, kind: ApplicationSet, name: apps }
+        fieldPaths:
+          - spec.generators.0.git.values.hubCertManager
+          - spec.generators.1.matrix.generators.0.git.values.hubCertManager
+          - spec.generators.2.git.values.hubCertManager

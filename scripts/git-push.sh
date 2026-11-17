@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Commit the given paths of this deployment repository, when they changed, and
+# push HEAD to origin, with no prompt.
+#
+# The token, a GitHub token that can write this repository, is optional. It
+# comes from scripts/clusters.sh's deployment_load: deployment.token in
+# .config/clusters.yaml, the environment winning, else the file named by
+# $DEPLOYMENT_TOKEN_FILE, else .config/deployment-token. git reads it through a temporary GIT_ASKPASS
+# helper (mode 700) that reads the file when git asks, so the token is never
+# on a command line, in the helper, or in the output. The helper is removed on
+# exit. Credential helpers you have configured are skipped for this push.
+# With no token, git pushes with your own login for origin (a credential
+# helper, gh or SSH), still with no prompt.
+#
+# Prints "nothing to push" when the paths have no changes and origin already
+# has HEAD. On a rejected push (origin moved, or the token can't write) it
+# exits 1 with git's reason and the next step; it never retries. PATHs that
+# don't exist and aren't tracked are skipped. With no git user.email set, it
+# commits as "AI Grid install" <ai-grid-install@localhost>.
+#
+# Usage: scripts/git-push.sh MESSAGE PATH...
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+dir="$(cd "$here/.." && pwd)"
+[ $# -ge 2 ] && [ -n "$1" ] || { echo "usage: git-push.sh MESSAGE PATH..." >&2; exit 2; }
+msg=$1; shift
+cd "$dir"
+export GIT_TERMINAL_PROMPT=0
+
+if [ -f "$dir/.config/clusters.yaml" ] || [ -f "$dir/clusters.yaml" ]; then
+  . "$here/clusters.sh"; deployment_load "$dir" || exit 1
+  token_file=$DEPLOYMENT_TOKEN_FILE
+else
+  token_file=${DEPLOYMENT_TOKEN_FILE:-}
+  [ -n "$token_file" ] || [ ! -s "$dir/.config/deployment-token" ] || token_file=.config/deployment-token
+fi
+if [ -n "$token_file" ]; then
+  case "$token_file" in /*) ;; *) token_file="$dir/$token_file" ;; esac
+  [ -r "$token_file" ] || { echo "error: no token file $token_file: put a token that can push to origin there" >&2; exit 1; }
+fi
+branch=$(git symbolic-ref --quiet --short HEAD) || { echo "error: HEAD isn't on a branch" >&2; exit 1; }
+
+if [ -n "$token_file" ]; then
+  askpass=$(mktemp "${TMPDIR:-/tmp}/git-askpass.XXXXXX"); trap 'rm -f "$askpass"' EXIT
+  chmod 700 "$askpass"
+  # The helper holds the file's path, never its contents.
+  printf '#!/bin/bash\ncase "$1" in Username*) echo x-access-token ;; *) head -n1 %q ;; esac\n' "$token_file" > "$askpass"
+  export GIT_ASKPASS=$askpass
+  gitc() { git -c credential.helper= "$@"; }
+  login_hint=""
+else
+  # No prompt from ssh either: a key passphrase it can't get fails instead.
+  export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes"
+  gitc() { git "$@"; }
+  login_hint="next: log in to GitHub so git can push to origin without a prompt (such as gh auth login), or set deployment.token in .config/clusters.yaml (make config creates it)"
+fi
+
+# Only the paths that exist or are tracked: a site directory that doesn't
+# exist yet would make git add fail on the rest.
+paths=()
+for p in "$@"; do
+  if [ -e "$p" ] || git ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then paths+=("$p"); fi
+done
+if [ ${#paths[@]} -gt 0 ] && [ -n "$(git status --porcelain -- "${paths[@]}")" ]; then
+  git add -- "${paths[@]}"
+  # A fresh CI runner has no git identity: commit as the install then.
+  ident=()
+  [ -n "$(git config user.email || true)" ] || ident=(-c user.name="AI Grid install" -c user.email=ai-grid-install@localhost)
+  git ${ident[@]+"${ident[@]}"} commit -q -m "$msg" -- "${paths[@]}"
+  echo "committed $(git rev-parse --short HEAD): $msg"
+fi
+
+remote=$(gitc ls-remote origin "refs/heads/$branch" 2>&1) ||
+  { echo "error: can't read origin ($(git remote get-url origin | sed -E 's#://[^@/]+@#://#')): $remote" >&2
+    [ -z "$login_hint" ] || echo "$login_hint" >&2; exit 1; }
+if [ "${remote%%[[:space:]]*}" = "$(git rev-parse HEAD)" ]; then echo "nothing to push"; exit 0; fi
+
+if ! out=$(gitc push --porcelain origin "HEAD:refs/heads/$branch" 2>&1); then
+  echo "$out" >&2
+  echo "error: push to origin ($branch) was rejected; git's reason is above. Nothing was retried." >&2
+  [ -z "$login_hint" ] || echo "$login_hint" >&2
+  echo "next: git pull --rebase origin $branch, then run make install again" >&2
+  exit 1
+fi
+echo "pushed $(git rev-parse --short HEAD) to origin $branch"

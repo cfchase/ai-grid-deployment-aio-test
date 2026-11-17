@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# Check that an install reached its end state, and hand its endpoints to a test
+# suite. Read-only: it changes nothing on any cluster.
+#
+#   scripts/ready-check.sh [--in-use]
+#
+# --in-use (make install passes it on a rerun on a hub that already uses this
+# catalog): the hub may already be in use, so a site in the grid, its
+# DataScienceCluster and the console's content are reported (INFO), not FAILs.
+#
+# Inputs: clusters.yaml, each cluster's login (.config/NAME/kubeconfig, from make
+# login), root/applicationset.yaml (the library pin), the branch root/inputs.env
+# names as deploymentRevision (default main) on origin, read with git ls-remote
+# and git fetch, with no prompt (when DEPLOYMENT_TOKEN_FILE, default
+# .config/deployment-token, names a readable file, git reads the token from it
+# through a temporary GIT_ASKPASS helper; else with your own git login for
+# origin), and .config/provider-admin-token
+# (scripts/provider-admin.sh) when it exists.
+#
+# It prints one line per assertion, OK, FAIL or WARN, and exits 1 on any FAIL:
+#   - every hub Application is Synced and Healthy, except those that wait for a
+#     site to join the grid (scripts/gates.sh, app_rows), which a WARN line lists:
+#     they're expected until a site is added;
+#   - the MultiClusterHub is Running;
+#   - the provider console, Keycloak and the Thanos query Routes answer, and the
+#     Perses Service has a ready endpoint (it has no Route: the console reaches it
+#     in-cluster);
+#   - LokiStack redhat-ods-monitoring/usage-logs is Ready;
+#   - each site is an available ManagedCluster with no ai-grid/ or location
+#     label, and has no DataScienceCluster: imported, not added to the grid (a
+#     missing resource type counts as none; any other API error is a FAIL);
+#   - deployment-root is Synced at the head of origin's deploymentRevision;
+#   - the console lists no organizations, models or subscriptions (WARN, not
+#     checked, without the provider-admin token). With keycloakOverlay=default
+#     in root/inputs.env, the library's example organizations are INFO.
+# With --in-use, the last two site checks and the console's content are INFO,
+# and so are the console's model Applications (acm-models-catalog-*) that
+# aren't Synced and Healthy: a model failing on a site doesn't stop a rerun.
+# With no FAIL it writes .install/outputs.json (git-ignored): the hub's name, API
+# and endpoint URLs, the token file's path (never the token), the library pin,
+# and each site's name, API, apps domain and ACM name (no role or location:
+# the provider console's Add to AI Grid sets those, after the install). persesURL is
+# the Service's in-cluster URL, not reachable from outside the hub.
+#
+# Perses is the Cluster Observability Operator's Service and the Thanos Route
+# ACM observability's; set PERSES_SERVICE or THANOS_ROUTE (NAMESPACE/NAME) to
+# check others.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+. "$here/clusters.sh"
+. "$here/gates.sh"
+deployment_load "$here/.."   # the deployment token, for reading origin
+dir=$CLUSTERS_DIR
+: "${PERSES_SERVICE:=openshift-cluster-observability-operator/perses}"
+: "${THANOS_ROUTE:=open-cluster-management-observability/rbac-query-proxy}"
+token_rel=.config/provider-admin-token
+in_use=""
+case "${1:-}" in --in-use) in_use=1 ;; "") ;; *) echo "usage: ready-check.sh [--in-use]" >&2; exit 2 ;; esac
+
+failed=0
+ok() { echo "OK   $*"; }
+fail() { echo "FAIL $*"; failed=1; }
+warn() { echo "WARN $*"; }
+info() { echo "INFO $*"; }
+
+check() { # DESCRIPTION CHECK [ARG...]: OK, or FAIL with the check's reason
+  local what=$1 out; shift
+  if out=$("$@" 2>&1); then ok "$what"; else fail "$what: $(grep . <<<"$out" | tail -n 1)"; fi
+}
+
+hub=$(hub_name)
+if ! login=$(cluster_login_ok "$hub" 2>&1); then
+  fail "hub $hub: ${login#error: }"; echo "Not ready: see FAIL above."; exit 1
+fi
+export KUBECONFIG; KUBECONFIG=$(cluster_kubeconfig "$hub")
+route_host() { oc get route "$2" -n "$1" -o json 2>/dev/null | jq -r '.spec.host // empty' 2>/dev/null || true; }
+url() { [ -z "$1" ] || echo "https://$1"; }
+ready_read() { # OC_ARG...: oc's output; empty when the resource or its type doesn't
+  # exist. Any other error prints oc's last stderr line and returns 1.
+  local out err rc=0
+  err=$(mktemp); out=$(oc "$@" 2>"$err") || rc=$?
+  if [ "$rc" != 0 ] && ! grep -qE "the server doesn't have a resource type|NotFound" "$err"; then
+    grep . "$err" | tail -n 1 || echo "oc exited $rc"; rm -f "$err"; return 1
+  fi
+  rm -f "$err"; [ "$rc" != 0 ] || printf '%s\n' "$out"
+}
+service_ready() { # NAMESPACE NAME: the Service has at least one ready endpoint
+  local out n
+  out=$(ready_read get endpointslices.discovery.k8s.io -n "$1" -l "kubernetes.io/service-name=$2" -o json) ||
+    { echo "Service $1/$2: $out"; return 1; }
+  n=$(jq '[.items[]?.endpoints[]? | select(.conditions.ready != false)] | length' <<<"${out:-{\}}" 2>/dev/null || echo 0)
+  [ "${n:-0}" -gt 0 ] || { echo "Service $1/$2: no ready endpoint"; return 1; }
+}
+
+# origin's deploymentRevision, read from the remote, never from a local ref that
+# may be old.
+export GIT_TERMINAL_PROMPT=0
+# deployment_load resolved the token, including the legacy .config/deployment-token.
+token_file=${DEPLOYMENT_TOKEN_FILE:-} login_hint=""
+case "$token_file" in ""|/*) ;; *) token_file="$dir/$token_file" ;; esac
+# With a token, only the token; without one, your own git login for origin, with
+# no prompt from ssh either.
+if [ -n "$token_file" ]; then gitc() { git -C "$dir" -c credential.helper= "$@"; }
+else
+  export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes"
+  gitc() { git -C "$dir" "$@"; }
+  login_hint="; log in to GitHub so git can read origin without a prompt (such as gh auth login), or set deployment.token in .config/clusters.yaml"
+fi
+branch=$( { [ -f "$dir/root/inputs.env" ] && sed -n 's/^deploymentRevision=//p' "$dir/root/inputs.env" | tail -n1; } || true)
+branch=${branch:-main}
+# keycloakOverlay=default brings the library Keycloak's example organizations.
+overlay=$( { [ -f "$dir/root/inputs.env" ] && sed -n 's/^keycloakOverlay=//p' "$dir/root/inputs.env" | tail -n1; } || true)
+main_sha="" main_err="" main_read=""
+read_main() { # sets main_sha, or main_err; reads origin once
+  [ -z "$main_read" ] || return 0; main_read=1
+  local out askpass=""
+  if [ -n "$token_file" ]; then
+    askpass=$(mktemp "${TMPDIR:-/tmp}/git-askpass.XXXXXX"); chmod 700 "$askpass"
+    # The helper holds the file's path, never its contents.
+    printf '#!/bin/bash\ncase "$1" in Username*) echo x-access-token ;; *) head -n1 %q ;; esac\n' "$token_file" > "$askpass"
+  fi
+  if ! out=$(GIT_ASKPASS=${askpass:-${GIT_ASKPASS:-}} gitc ls-remote origin "refs/heads/$branch" 2>&1); then
+    main_err="can't read origin: $(grep . <<<"$out" | tail -n 1)$login_hint"
+  elif [ -z "$out" ]; then main_err="origin has no $branch branch"
+  else
+    main_sha=${out%%[[:space:]]*}
+    out=$(GIT_ASKPASS=${askpass:-${GIT_ASKPASS:-}} gitc fetch -q origin "$branch" 2>&1) ||
+      main_err="can't fetch origin $branch: $(grep . <<<"$out" | tail -n 1)"
+  fi
+  [ -z "$askpass" ] || rm -f "$askpass"
+}
+
+# The hub.
+if [ -n "$in_use" ]; then
+  check "hub Applications Synced and Healthy, except those that wait for a site and the console's models" apps_healthy --in-use
+else
+  check "hub Applications Synced and Healthy, except those that wait for a site" apps_healthy
+fi
+if apps=$(oc get applications.argoproj.io -n openshift-gitops -o json 2>/dev/null); then
+  waiting=$(app_rows "$apps" "$(unmatched_placements || true)" |
+    awk -F'\t' '$4 == "site" && $2" "$3 != "Synced Healthy" {print $1}' | paste -sd, - | sed 's/,/, /g' || true)
+  [ -z "$waiting" ] || warn "Applications that wait for a site, expected until a site is added: $waiting"
+  if [ -n "$in_use" ]; then
+    models=$(app_rows "$apps" "[]" | awk -F'\t' '$1 ~ /^acm-models-catalog-/ && $2" "$3 != "Synced Healthy" {print $1 " (" $2 " " $3 ")"}' |
+      paste -sd, - | sed 's/,/, /g' || true)
+    [ -z "$models" ] || info "the console's model Applications not Synced and Healthy: $models"
+  fi
+fi
+check "MultiClusterHub Running" mch_running
+# The chart's Route, by name: the provider-admin token is sent to its host, so
+# never another Route someone added to the namespace.
+check "provider console answers" route_answers ai-grid-provider-console ai-grid-provider-console
+console_host=$(route_host ai-grid-provider-console ai-grid-provider-console)
+check "Keycloak answers" route_answers maas-db keycloak
+check "Perses Service ${PERSES_SERVICE} has a ready endpoint (in-cluster)" service_ready "${PERSES_SERVICE%%/*}" "${PERSES_SERVICE#*/}"
+check "Thanos query answers" route_answers "${THANOS_ROUTE%%/*}" "${THANOS_ROUTE#*/}"
+loki=$(oc get lokistack usage-logs -n redhat-ods-monitoring -o json 2>/dev/null |
+  jq -r '[.status.conditions[]? | select(.type == "Ready") | .status][0] // "Unknown"' 2>/dev/null || true)
+if [ "$loki" = True ]; then ok "LokiStack redhat-ods-monitoring/usage-logs Ready"
+else fail "LokiStack redhat-ods-monitoring/usage-logs Ready: ${loki:-not created yet}"; fi
+
+# The sites: imported and waiting, not added to the grid.
+sites_json='[]' root_checked=""
+for name in $(site_names); do
+  check "site $name: ManagedCluster available" managedcluster_available "$name"
+  if ! mc=$(ready_read get managedclusters.cluster.open-cluster-management.io "$name" -o json); then
+    fail "site $name: can't read its labels: $mc"
+  else
+    labels=$(jq -r '.metadata.labels // {} | keys[] | select(startswith("ai-grid/") or . == "location")' <<<"${mc:-{\}}" 2>/dev/null || true)
+    if [ -z "$labels" ]; then ok "site $name: not added to the grid (no ai-grid/ or location label)"
+    elif [ -n "$in_use" ]; then info "site $name: in the grid: labels $(echo $labels | sed 's/ /, /g')"
+    else fail "site $name: added to the grid by the install: labels $(echo $labels | sed 's/ /, /g')"; fi
+  fi
+
+  domain=""
+  if login=$(cluster_login_ok "$name" 2>&1); then
+    sk=$(cluster_kubeconfig "$name")
+    if ! dsc=$(KUBECONFIG=$sk ready_read get datascienceclusters -A -o name); then
+      fail "site $name: can't read its DataScienceClusters: $dsc"
+    elif [ -z "$dsc" ]; then ok "site $name: no DataScienceCluster"
+    elif [ -n "$in_use" ]; then info "site $name: has a DataScienceCluster ($(echo $dsc))"
+    else fail "site $name: has a DataScienceCluster ($(echo $dsc)): OpenShift AI comes with the Add, not the install"; fi
+    domain=$(KUBECONFIG=$sk oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null || true)
+    [ -n "$domain" ] || fail "site $name: can't read its apps domain"
+  else
+    fail "site $name: ${login#error: }"; sk=""
+  fi
+
+  if [ -z "$root_checked" ]; then
+    root_checked=1; read_main
+    if [ -z "$main_err" ]; then check "deployment-root Synced at origin's $branch ($main_sha)" root_synced_to "$main_sha"
+    else fail "deployment-root Synced at origin's $branch: $main_err"; fi
+  fi
+  sites_json=$(jq -c --arg n "$name" --arg a "$(cluster_api "$name")" --arg d "$domain" \
+    '. + [{name: $n, api: $a, appsDomain: $d, acmName: $n}]' <<<"$sites_json")
+done
+
+# No test content: the console lists no organizations, models or subscriptions.
+none_listed() { # SERVICE NOUN: ai_grid.v1.SERVICE/List lists no NOUN
+  local code n
+  code=$(curl -sS --max-time 20 -o "$tmp/body" -X POST -H "@$tmp/auth" -H 'Content-Type: application/json' \
+    -H 'Connect-Protocol-Version: 1' --data-binary '{}' -w '%{http_code}' \
+    "https://$console_host/ai_grid.v1.$1/List" 2>/dev/null) || code=000
+  n=$(jq -r '.total // (.items | length)' "$tmp/body" 2>/dev/null || true)
+  if [ "$code" != 200 ] || [ -z "$n" ]; then fail "no ${2}s: ai_grid.v1.$1/List answered HTTP $code"
+  elif [ "$n" = 0 ]; then ok "no ${2}s"
+  elif [ -n "$in_use" ]; then info "the console lists $n $2(s)"
+  elif [ "$1" = Tenants ] && [ "$overlay" = default ]; then info "the console lists $n $2(s): keycloakOverlay=default's examples"
+  else fail "no ${2}s: the console lists $n $2(s); the install creates none"; fi
+}
+if [ ! -f "$dir/$token_rel" ]; then
+  warn "organizations, models and subscriptions not checked: no $token_rel (make provider-admin)"
+elif [ -z "$console_host" ]; then
+  fail "no organizations, models or subscriptions: no console Route to ask"
+else
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+  (umask 077; { printf 'Authorization: Bearer '; tr -d '\r\n' < "$dir/$token_rel"; printf '\n'; } > "$tmp/auth")
+  none_listed Tenants organization
+  none_listed Models model
+  none_listed Subscriptions subscription
+fi
+
+[ "$failed" = 0 ] || { echo "Not ready: see FAIL above."; exit 1; }
+
+. "$here/library.sh"
+rev=$(library_pin "$dir" libraryRevision)
+lib=$(library_pin "$dir" libraryRepoURL)
+mkdir -p "$dir/.install"
+jq -n --arg hub "$hub" --arg api "$(cluster_api "$hub")" \
+  --arg console "$(url "$console_host")" \
+  --arg keycloak "$(url "$(route_host maas-db keycloak)")" \
+  --arg perses "https://${PERSES_SERVICE#*/}.${PERSES_SERVICE%%/*}.svc:8080" \
+  --arg thanos "$(url "$(route_host "${THANOS_ROUTE%%/*}" "${THANOS_ROUTE#*/}")")" \
+  --arg token "$token_rel" --arg lib "$lib" --arg rev "$rev" --argjson sites "$sites_json" \
+  '{hub: {name: $hub, api: $api, consoleURL: $console, keycloakURL: $keycloak, keycloakRealm: "saas",
+          persesURL: $perses, thanosURL: $thanos, lokiStack: "redhat-ods-monitoring/usage-logs"},
+    providerAdminTokenFile: $token, library: {url: $lib, revision: $rev}, sites: $sites}' \
+  > "$dir/.install/outputs.json.tmp"
+mv "$dir/.install/outputs.json.tmp" "$dir/.install/outputs.json"
+echo "Ready. Outputs: .install/outputs.json"
