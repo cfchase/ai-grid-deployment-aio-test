@@ -47,8 +47,8 @@ spec:
                         apps.open-cluster-management.io/acm-cluster: "true"
                         name: '{{ .clusterName }}'
           - git:
-              repoURL: REQUIRED-catalogRepoURL
-              revision: REQUIRED-catalogRevision
+              repoURL: https://github.com/cfchase/ai-grid-catalog-aio-test.git
+              revision: main
               directories:
                 - path: 'catalog/clusters/{{.name}}'
   template:
@@ -58,8 +58,8 @@ spec:
     spec:
       project: acm-models-catalog-models
       source:
-        repoURL: REQUIRED-catalogRepoURL
-        targetRevision: REQUIRED-catalogRevision
+        repoURL: https://github.com/cfchase/ai-grid-catalog-aio-test.git
+        targetRevision: main
         path: '{{.path.path}}'
         kustomize: {}
       destination:
@@ -120,8 +120,8 @@ spec:
                         apps.open-cluster-management.io/acm-cluster: "true"
                         name: '{{ .clusterName }}'
           - git:
-              repoURL: REQUIRED-catalogRepoURL
-              revision: REQUIRED-catalogRevision
+              repoURL: https://github.com/cfchase/ai-grid-catalog-aio-test.git
+              revision: main
               directories:
                 - path: 'catalog/ingress'
   template:
@@ -135,8 +135,8 @@ spec:
     spec:
       project: acm-models-catalog-maas
       source:
-        repoURL: REQUIRED-catalogRepoURL
-        targetRevision: REQUIRED-catalogRevision
+        repoURL: https://github.com/cfchase/ai-grid-catalog-aio-test.git
+        targetRevision: main
         path: '{{.path.path}}'
         kustomize: {}
       destination:
@@ -196,8 +196,8 @@ spec:
                         apps.open-cluster-management.io/acm-cluster: "true"
                         name: '{{ .clusterName }}'
           - git:
-              repoURL: REQUIRED-catalogRepoURL
-              revision: REQUIRED-catalogRevision
+              repoURL: https://github.com/cfchase/ai-grid-catalog-aio-test.git
+              revision: main
               directories:
                 - path: 'catalog/subscriptions'
   template:
@@ -211,8 +211,8 @@ spec:
     spec:
       project: acm-models-catalog-maas
       source:
-        repoURL: REQUIRED-catalogRepoURL
-        targetRevision: REQUIRED-catalogRevision
+        repoURL: https://github.com/cfchase/ai-grid-catalog-aio-test.git
+        targetRevision: main
         path: '{{.path.path}}'
         directory:
           include: "*.yaml"
