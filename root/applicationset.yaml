@@ -48,7 +48,7 @@ spec:
         # from inputs.env (kustomization.yaml).
         values: &inputs
           libraryRepoURL: &libraryRepoURL https://github.com/ai-grid-cloud/ai-grid-cluster-gitops.git
-          libraryRevision: &libraryRevision fix/platform-cert-manager
+          libraryRevision: &libraryRevision main
           deploymentRepoURL: REQUIRED-deploymentRepoURL
           deploymentRevision: REQUIRED-deploymentRevision
           catalogRepoURL: REQUIRED-catalogRepoURL
